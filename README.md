@@ -4,19 +4,21 @@ WiFi-based whole-home presence sensing, biometric monitoring, and VR body tracki
 
 ## Credits & Attribution
 
-This project is a setup package and tooling wrapper built on top of **[RuView by ruvnet](https://github.com/ruvnet/ruview)** — all sensing, ML, and server code is their work. All credit for the core WiFi-DensePose technology goes to the ruvnet team.
+This project is a setup package and tooling wrapper. The core technologies are built by others — please go star their repos.
+
+**[RuView by ruvnet](https://github.com/ruvnet/ruview)** — all WiFi sensing, ML inference, ESP32 firmware, and server code. This is the engine that makes everything work.
+
+**[SlimeVR](https://github.com/SlimeVR/SlimeVR-Server)** — the open source body tracking platform that receives our pose data and feeds it into VR games. The SlimeVR UDP protocol is what the bridge speaks to deliver virtual trackers to SteamVR.
 
 **Original code in this repo:**
-- `install.sh` — cross-platform auto-detecting installer
-- `ruview-slimevr-bridge.py` — SlimeVR VR body tracking bridge (novel integration)
+- `install.sh` — cross-platform auto-detecting installer (WSL2, native Linux, macOS)
+- `ruview-slimevr-bridge.py` — SlimeVR VR body tracking bridge with T-pose player calibration
 - `flash_board.sh` — WSL2 board flashing helper
 
 **From ruvnet/ruview:**
 - `esp32-csi-node.bin` and all firmware binaries — ESP32-S3 CSI capture firmware
 - `provision.py` — ESP32 WiFi provisioning script
 - The ruview Docker image (`ruvnet/wifi-densepose`) — all sensing, ML inference, and API
-
-If you find this useful, go star the upstream repo: https://github.com/ruvnet/ruview
 
 ## What this does
 
@@ -53,17 +55,24 @@ The installer auto-detects your OS, distro, and environment (WSL2, native Linux,
 
 ## VR body tracking (SlimeVR bridge)
 
-The included `ruview-slimevr-bridge.py` reads ruview's 17-keypoint pose data and sends it to SlimeVR server as virtual trackers. Provides hip, chest, thigh, and shin tracking for two simultaneous players.
+The included `ruview-slimevr-bridge.py` reads ruview's 17-keypoint pose data and sends it to SlimeVR server as virtual trackers. Supports two simultaneous players with T-pose calibration to prevent bystanders from interfering with tracking.
 
-Trackers per person:
-- Hip (torso rotation — eliminates thumbstick turning)
+### T-pose calibration
+
+Before the session starts, each player strikes a T-pose (arms out straight, level with shoulders) and holds it for 2 seconds. The bridge locks that person ID to that player slot. Only the two calibrated players are ever forwarded to SlimeVR — anyone else who walks into the room is ignored.
+
+### Trackers per player
+- Hip (torso rotation — eliminates thumbstick turning in VR)
 - Chest
 - Left + right thigh
 - Left + right shin
 
-Run command:
+### Run command
 ```bash
 python3 ruview-slimevr-bridge.py --slimevr-host YOUR_GAMING_PC_IP
+
+# Single player
+python3 ruview-slimevr-bridge.py --slimevr-host YOUR_GAMING_PC_IP --players 1
 ```
 
 ## Files
