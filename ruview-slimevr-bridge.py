@@ -6,19 +6,17 @@ Bridges ruview WiFi pose data to SlimeVR virtual trackers.
 Reads 17-keypoint COCO pose from ruview WebSocket and sends
 quaternion rotation packets to SlimeVR server via UDP.
 
-Registration is zone-based — a marked spot on the floor acts as
-a registration node. When a person enters that zone they are
-automatically assigned a player slot. When they cross the exit
-zone they are deregistered. No T-pose or headset communication needed.
+Zone-based registration — physical floor markers handle everything:
+  - Stand at the registration spot for 1.5s to claim a player slot
+  - Walk through the exit zone to release your slot
+  - Scales to any number of simultaneous players
 
-Scales to any number of simultaneous players (home or VR farm).
+First time setup:
+  python3 ruview-slimevr-bridge.py --setup
 
-Usage:
+Normal use:
   python3 ruview-slimevr-bridge.py --slimevr-host 192.168.12.102
   python3 ruview-slimevr-bridge.py --slimevr-host 192.168.12.102 --max-players 10
-  python3 ruview-slimevr-bridge.py --slimevr-host 192.168.12.102 \\
-      --reg-zone 0.1,0.5 --reg-radius 0.08 \\
-      --exit-zone 0.9,0.5 --exit-radius 0.1
 """
 
 import asyncio
@@ -28,6 +26,7 @@ import socket
 import struct
 import argparse
 import time
+import os
 import websockets
 
 PACKET_HANDSHAKE     = 3
@@ -42,17 +41,46 @@ TRACKER_RIGHT_SHIN  = 5
 
 TRACKER_COUNT = 6
 
-# Default zone centers in normalized ruview space (0.0 - 1.0)
-# Registration node: left side of room
-DEFAULT_REG_ZONE   = (0.1, 0.5)
-DEFAULT_REG_RADIUS = 0.08
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'zones.json')
 
-# Exit/deregistration zone: right side of room
+# Defaults used if no zones.json exists yet
+DEFAULT_REG_ZONE    = (0.1, 0.5)
+DEFAULT_REG_RADIUS  = 0.08
 DEFAULT_EXIT_ZONE   = (0.9, 0.5)
 DEFAULT_EXIT_RADIUS = 0.10
 
-# How long a person must stand in the registration zone before locking
-REG_DWELL_SECONDS = 1.5
+REG_DWELL_SECONDS    = 1.5   # seconds to stand in reg zone before locking
+SETUP_DWELL_SECONDS  = 3.0   # seconds to stand still during zone setup
+REACQUIRE_DISTANCE   = 0.15  # max normalized distance for ID reacquisition
+COOLDOWN_SECONDS     = 5.0   # seconds a zone position is locked out after deregistration
+
+
+# ── Config persistence ────────────────────────────────────────────────────────
+
+def load_zones():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            c = json.load(f)
+        print(f"Loaded zone config from {CONFIG_FILE}")
+        return (
+            tuple(c['reg_zone']),
+            c['reg_radius'],
+            tuple(c['exit_zone']),
+            c['exit_radius'],
+        )
+    print("No zones.json found — using defaults. Run --setup to configure zones.")
+    return DEFAULT_REG_ZONE, DEFAULT_REG_RADIUS, DEFAULT_EXIT_ZONE, DEFAULT_EXIT_RADIUS
+
+def save_zones(reg_zone, reg_radius, exit_zone, exit_radius):
+    config = {
+        'reg_zone':    list(reg_zone),
+        'reg_radius':  reg_radius,
+        'exit_zone':   list(exit_zone),
+        'exit_radius': exit_radius,
+    }
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+    print(f"Zone config saved to {CONFIG_FILE}")
 
 
 # ── Math helpers ──────────────────────────────────────────────────────────────
@@ -129,12 +157,11 @@ def extract_keypoints(person):
     return kps
 
 def person_position_2d(kps):
-    """Estimate person's floor position from hip midpoint."""
     lhip = kps.get('left_hip')
     rhip = kps.get('right_hip')
     if lhip and rhip:
         mid = midpoint(lhip, rhip)
-        return (mid[0], mid[2])   # x and depth as floor coords
+        return (mid[0], mid[2])
     return None
 
 def compute_trackers(kps):
@@ -162,6 +189,95 @@ def compute_trackers(kps):
         TRACKER_LEFT_SHIN:   vec_to_quaternion(subtract(lankle, lknee)),
         TRACKER_RIGHT_SHIN:  vec_to_quaternion(subtract(rankle, rknee)),
     }
+
+
+# ── Interactive zone setup ────────────────────────────────────────────────────
+
+async def run_setup(ruview_ws_url, api_token=None):
+    """
+    Interactive zone setup mode. Administrator stands at each zone location
+    so the system can record the coordinates. Saves to zones.json.
+    """
+    headers = {}
+    if api_token:
+        headers['Authorization'] = f'Bearer {api_token}'
+
+    print("\n" + "=" * 55)
+    print("  ZONE SETUP MODE")
+    print("=" * 55)
+    print("""
+This will record the positions of two floor zones:
+
+  1. REGISTRATION zone — where players stand to join
+  2. EXIT zone — where players walk to leave the session
+
+You will stand at each location so the system can detect
+your position. Make sure you are the only person in the
+room during setup, or the only one moving.
+""")
+
+    async with websockets.connect(ruview_ws_url, additional_headers=headers) as ws:
+
+        async def capture_position(zone_name):
+            print(f"─── {zone_name} ───")
+            print(f"Stand at the {zone_name.lower()} spot now and hold still...")
+            positions = []
+            start = None
+
+            async for message in ws:
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+
+                persons = data.get('persons', [])
+                if not persons:
+                    continue
+
+                person = persons[0]
+                kps = extract_keypoints(person)
+                pos = person_position_2d(kps)
+                if pos is None:
+                    continue
+
+                if start is None:
+                    start = time.monotonic()
+
+                elapsed = time.monotonic() - start
+                positions.append(pos)
+
+                remaining = SETUP_DWELL_SECONDS - elapsed
+                print(f"\r  Detected at ({pos[0]:.3f}, {pos[1]:.3f}) — "
+                      f"hold for {max(0, remaining):.1f}s...   ", end='', flush=True)
+
+                if elapsed >= SETUP_DWELL_SECONDS:
+                    avg_x = sum(p[0] for p in positions) / len(positions)
+                    avg_y = sum(p[1] for p in positions) / len(positions)
+                    print(f"\n  {zone_name} set to ({avg_x:.4f}, {avg_y:.4f})\n")
+                    return (avg_x, avg_y)
+
+        reg_zone  = await capture_position("REGISTRATION ZONE")
+        exit_zone = await capture_position("EXIT ZONE")
+
+        reg_radius  = DEFAULT_REG_RADIUS
+        exit_radius = DEFAULT_EXIT_RADIUS
+
+        save_zones(reg_zone, reg_radius, exit_zone, exit_radius)
+
+        print("\n" + "=" * 55)
+        print("  SETUP COMPLETE")
+        print("=" * 55)
+        print(f"""
+  Registration zone : {reg_zone}  radius: {reg_radius}
+  Exit zone         : {exit_zone}  radius: {exit_radius}
+
+  Mark these spots on the floor (tape, mat, or sign).
+  Players stand at the registration spot to join.
+  Players walk through the exit spot to leave.
+
+  Start the bridge normally when ready:
+    python3 ruview-slimevr-bridge.py --slimevr-host YOUR_PC_IP
+""")
 
 
 # ── SlimeVR UDP sender ────────────────────────────────────────────────────────
@@ -211,12 +327,11 @@ class SessionRegistry:
         self.exit_radius = exit_radius
         self.max_players = max_players
 
-        self.pid_to_slot  = {}   # person_id -> player_slot
-        self.slot_to_pid  = {}   # player_slot -> person_id
-        self.next_slot    = 0
-
-        # Tracks how long each unregistered person has been in the reg zone
-        self.reg_dwell    = {}   # person_id -> entry timestamp
+        self.pid_to_slot      = {}   # person_id -> player_slot
+        self.slot_to_pid      = {}   # player_slot -> person_id
+        self.slot_last_pos    = {}   # player_slot -> last known position
+        self.reg_dwell        = {}   # person_id -> entry timestamp
+        self.exit_cooldowns   = []   # list of (timestamp, position) — recently freed zones
 
     def _next_available_slot(self):
         used = set(self.slot_to_pid.keys())
@@ -225,15 +340,46 @@ class SessionRegistry:
                 return s
         return None
 
+    def _in_cooldown(self, pos):
+        now = time.monotonic()
+        self.exit_cooldowns = [
+            (t, p) for t, p in self.exit_cooldowns
+            if now - t < COOLDOWN_SECONDS
+        ]
+        return any(distance_2d(pos, p) < self.reg_radius for _, p in self.exit_cooldowns)
+
+    def _try_reacquire(self, pid, pos):
+        """
+        If ruview lost and reassigned a player's ID, find their slot
+        by nearest last-known position and transfer the assignment.
+        """
+        best_slot = None
+        best_dist = REACQUIRE_DISTANCE
+
+        for slot, last_pos in self.slot_last_pos.items():
+            if slot in self.slot_to_pid:
+                continue   # slot already has an active pid
+            d = distance_2d(pos, last_pos)
+            if d < best_dist:
+                best_dist = d
+                best_slot = slot
+
+        if best_slot is not None:
+            self.pid_to_slot[pid] = best_slot
+            self.slot_to_pid[best_slot] = pid
+            print(f"  Reacquired: person {pid} matched to player slot {best_slot + 1}.")
+            return True
+        return False
+
     def process(self, persons):
-        """
-        Update registry based on current frame's person list.
-        Returns (newly_registered, newly_deregistered) person_id sets.
-        """
         now = time.monotonic()
         current_pids = {p.get('id') for p in persons}
-        registered   = set()
-        deregistered = set()
+
+        # Detect slots whose pid disappeared — mark slot as vacant but keep last_pos
+        for slot, pid in list(self.slot_to_pid.items()):
+            if pid not in current_pids:
+                del self.pid_to_slot[pid]
+                del self.slot_to_pid[slot]
 
         for person in persons:
             pid = person.get('id')
@@ -242,41 +388,54 @@ class SessionRegistry:
             if pos is None:
                 continue
 
-            # Deregistration check — registered player enters exit zone
+            # Update last known position for active players
             if pid in self.pid_to_slot:
+                self.slot_last_pos[self.pid_to_slot[pid]] = pos
+
+                # Deregistration check
                 if in_zone(pos, self.exit_zone, self.exit_radius):
                     slot = self.pid_to_slot.pop(pid)
                     del self.slot_to_pid[slot]
+                    self.exit_cooldowns.append((now, pos))
                     self.reg_dwell.pop(pid, None)
-                    deregistered.add(pid)
                     print(f"  Player {slot + 1} (person {pid}) deregistered at exit zone.")
+                continue
 
-            # Registration check — unregistered person enters reg zone
-            elif len(self.slot_to_pid) < self.max_players:
-                if in_zone(pos, self.reg_zone, self.reg_radius):
-                    if pid not in self.reg_dwell:
-                        self.reg_dwell[pid] = now
-                        print(f"  Person {pid} entering registration zone — hold position...")
-                    elif now - self.reg_dwell[pid] >= REG_DWELL_SECONDS:
-                        slot = self._next_available_slot()
-                        if slot is not None:
-                            self.pid_to_slot[pid] = slot
-                            self.slot_to_pid[slot] = pid
-                            self.reg_dwell.pop(pid, None)
-                            registered.add(pid)
-                            print(f"  Player {slot + 1} registered (person {pid}).")
-                else:
-                    self.reg_dwell.pop(pid, None)
+            # Try reacquiring a slot for a new pid near a recently lost player
+            if self._try_reacquire(pid, pos):
+                continue
+
+            # Registration check for new unregistered persons
+            if len(self.slot_to_pid) >= self.max_players:
+                continue
+
+            if in_zone(pos, self.reg_zone, self.reg_radius):
+                # Don't register if this position was just freed (cooldown)
+                if self._in_cooldown(pos):
+                    continue
+
+                if pid not in self.reg_dwell:
+                    self.reg_dwell[pid] = now
+                    print(f"  Person {pid} in registration zone — hold for "
+                          f"{REG_DWELL_SECONDS:.0f}s...")
+                elif now - self.reg_dwell[pid] >= REG_DWELL_SECONDS:
+                    slot = self._next_available_slot()
+                    if slot is not None:
+                        self.pid_to_slot[pid] = slot
+                        self.slot_to_pid[slot] = pid
+                        self.slot_last_pos[slot] = pos
+                        self.reg_dwell.pop(pid, None)
+                        print(f"  Player {slot + 1} registered (person {pid}).")
+            else:
+                self.reg_dwell.pop(pid, None)
 
         # Clean up dwell tracking for people who left the frame
-        gone = set(self.reg_dwell.keys()) - current_pids
-        for pid in gone:
-            del self.reg_dwell[pid]
-
-        return registered, deregistered
+        for pid in list(self.reg_dwell):
+            if pid not in current_pids:
+                del self.reg_dwell[pid]
 
     def active_players(self):
-        return dict(self.slot_to_pid)   # slot -> pid
+        return dict(self.slot_to_pid)
 
 
 # ── Bridge loop ───────────────────────────────────────────────────────────────
@@ -295,10 +454,10 @@ async def run_bridge(ruview_ws_url, slimevr_host, slimevr_port,
 
     print(f"\nConnecting to ruview  → {ruview_ws_url}")
     print(f"Forwarding to SlimeVR → {slimevr_host}:{slimevr_port}")
-    print(f"Max players: {max_players}")
-    print(f"Registration zone: center={reg_zone} radius={reg_radius}")
-    print(f"Exit zone:         center={exit_zone} radius={exit_radius}")
-    print(f"\nWaiting for players to enter the registration zone...\n")
+    print(f"Max players    : {max_players}")
+    print(f"Register zone  : center={reg_zone}  radius={reg_radius}")
+    print(f"Exit zone      : center={exit_zone}  radius={exit_radius}")
+    print(f"\nReady. Players stand at the registration spot to join.\n")
 
     async with websockets.connect(ruview_ws_url, additional_headers=headers) as ws:
         print("Connected to ruview.\n")
@@ -342,34 +501,41 @@ def main():
     parser = argparse.ArgumentParser(
         description='ruview → SlimeVR bridge with zone-based player registration'
     )
+    parser.add_argument('--setup', action='store_true',
+                        help='Run interactive zone setup mode (admin, one time)')
     parser.add_argument('--ruview-ws', default='ws://192.168.12.150:3001/ws/sensing')
-    parser.add_argument('--slimevr-host', required=True)
+    parser.add_argument('--slimevr-host', default=None)
     parser.add_argument('--slimevr-port', type=int, default=6969)
-    parser.add_argument('--max-players', type=int, default=2,
-                        help='Maximum simultaneous players (default 2, no upper limit)')
-    parser.add_argument('--reg-zone', type=parse_xy,
-                        default=DEFAULT_REG_ZONE,
-                        metavar='X,Y',
-                        help='Registration zone center in normalized coords (default: 0.1,0.5)')
-    parser.add_argument('--reg-radius', type=float, default=DEFAULT_REG_RADIUS,
-                        help='Registration zone radius (default: 0.08)')
-    parser.add_argument('--exit-zone', type=parse_xy,
-                        default=DEFAULT_EXIT_ZONE,
-                        metavar='X,Y',
-                        help='Exit/deregistration zone center (default: 0.9,0.5)')
-    parser.add_argument('--exit-radius', type=float, default=DEFAULT_EXIT_RADIUS,
-                        help='Exit zone radius (default: 0.10)')
+    parser.add_argument('--max-players', type=int, default=2)
+    parser.add_argument('--reg-zone', type=parse_xy, default=None, metavar='X,Y')
+    parser.add_argument('--reg-radius', type=float, default=None)
+    parser.add_argument('--exit-zone', type=parse_xy, default=None, metavar='X,Y')
+    parser.add_argument('--exit-radius', type=float, default=None)
     parser.add_argument('--api-token', default='a7f3d2e1-9b4c-4f8a-b6e2-3d5c1a0f7e94')
     args = parser.parse_args()
+
+    if args.setup:
+        asyncio.run(run_setup(args.ruview_ws, args.api_token))
+        return
+
+    if not args.slimevr_host:
+        parser.error('--slimevr-host is required unless running --setup')
+
+    # Load saved zones, then allow CLI overrides
+    reg_zone, reg_radius, exit_zone, exit_radius = load_zones()
+    if args.reg_zone:   reg_zone    = args.reg_zone
+    if args.reg_radius: reg_radius  = args.reg_radius
+    if args.exit_zone:  exit_zone   = args.exit_zone
+    if args.exit_radius: exit_radius = args.exit_radius
 
     asyncio.run(run_bridge(
         args.ruview_ws,
         args.slimevr_host,
         args.slimevr_port,
-        args.reg_zone,
-        args.reg_radius,
-        args.exit_zone,
-        args.exit_radius,
+        reg_zone,
+        reg_radius,
+        exit_zone,
+        exit_radius,
         args.max_players,
         args.api_token,
     ))

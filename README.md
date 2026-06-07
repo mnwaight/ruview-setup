@@ -65,10 +65,10 @@ The included `ruview-slimevr-bridge.py` reads ruview's 17-keypoint pose data and
 
 Registration is handled by physical floor zones — no T-poses, no menus, no staff intervention. Two marked spots on the floor do all the work.
 
-- **Registration node** — a marked spot near the entrance. Stand in it for 1.5 seconds and you are automatically assigned a player slot.
-- **Exit node** — a marked zone near the exit. Walk through it and your slot is automatically freed for the next player.
+- **Registration zone** — a marked spot near the entrance. Stand in it for 1.5 seconds to claim a player slot.
+- **Exit zone** — a marked zone near the exit. Walk through it to release your slot.
 
-This scales to any number of simultaneous players. In a home setup the defaults work out of the box. In a VR farm, players walk in, register, play, walk out, and deregister — the system manages itself.
+This scales to any number of simultaneous players. At home it works identically — one person sets up zones once, then anyone with a headset just walks in and plays. In a VR farm, players walk in, register, play, walk out, and deregister with no staff intervention.
 
 ### Trackers per player
 - Hip (torso rotation — eliminates thumbstick turning in VR)
@@ -76,14 +76,41 @@ This scales to any number of simultaneous players. In a home setup the defaults 
 - Left + right thigh
 - Left + right shin
 
-### Setup — step by step
+### Re-registration and ID loss protection
+
+If ruview temporarily loses track of a player and assigns them a new person ID, the bridge automatically reacquires them by matching their new position to their last known position. Players do not need to re-register.
+
+If a registered player walks near the registration zone during play, nothing happens — only unregistered person IDs can trigger registration. A 5-second cooldown also prevents the zone from immediately re-registering someone who just deregistered.
+
+---
+
+### Administrator setup — first time only
+
+Before players can use the system, an administrator sets the physical zone locations once. This is done by standing at each spot so the system can record the coordinates.
+
+**Make sure you are the only person in the room during setup.**
+
+```bash
+python3 ruview-slimevr-bridge.py --setup
+```
+
+The setup wizard will:
+1. Ask you to stand at the **registration spot** and hold still for 3 seconds
+2. Ask you to stand at the **exit spot** and hold still for 3 seconds
+3. Save both coordinates to `zones.json` in the same directory
+
+After setup, mark both spots on the floor with tape, a mat, or a sign. Zone config persists across restarts — you only need to run setup once unless you rearrange the room.
+
+---
+
+### Player setup — step by step
 
 **Prerequisites:**
 - ruview server running on your dedicated machine
 - SlimeVR Server installed on your gaming PC (download from [slimevr.dev](https://slimevr.dev))
 - SlimeVR companion app sideloaded on both Quest 3 headsets via [SideQuest](https://sidequestvr.com)
 - Both headsets on the same local network as the ruview server
-- Two marked spots on the floor — one near the entrance (registration), one near the exit
+- Admin has completed zone setup and floor spots are marked
 
 **Steps:**
 
@@ -93,27 +120,23 @@ This scales to any number of simultaneous players. In a home setup the defaults 
    ```bash
    python3 ruview-slimevr-bridge.py --slimevr-host YOUR_GAMING_PC_IP
    ```
-4. Player 1 walks to the registration spot and stands still for 1.5 seconds — registered automatically
-5. Player 2 does the same
-6. Both players are live — body tracking streams to SlimeVR immediately
-7. Launch your VR game. Hip rotation maps to body turning — no thumbstick needed
-8. When done, each player walks through the exit zone to deregister
+4. Each player walks to the registration spot and stands still for 1.5 seconds — registered automatically
+5. Body tracking streams to SlimeVR immediately after registration
+6. Launch your VR game — hip rotation maps to body turning, no thumbstick needed
+7. When done, each player walks through the exit zone to deregister
 
-**Notes:**
-- Anyone who does not stand at the registration spot is ignored entirely
-- Scales beyond 2 players with `--max-players`
-- For SteamVR games, configure hip-to-locomotion turning in SteamVR input bindings per game
+**Scaling:** additional players with headsets just walk to the registration spot. No config changes needed. Set `--max-players` to match your space.
 
 ### Run command
 ```bash
+# First time zone setup (admin only)
+python3 ruview-slimevr-bridge.py --setup
+
 # Two players (default)
 python3 ruview-slimevr-bridge.py --slimevr-host YOUR_GAMING_PC_IP
 
-# VR farm — 10 players, custom zone positions
-python3 ruview-slimevr-bridge.py --slimevr-host YOUR_GAMING_PC_IP \
-    --max-players 10 \
-    --reg-zone 0.1,0.5 --reg-radius 0.08 \
-    --exit-zone 0.9,0.5 --exit-radius 0.10
+# VR farm — 10 players
+python3 ruview-slimevr-bridge.py --slimevr-host YOUR_GAMING_PC_IP --max-players 10
 ```
 
 ## Files
