@@ -2,7 +2,21 @@
 
 WiFi-based whole-home presence sensing, biometric monitoring, and VR body tracking.
 
-Built around the [RuView](https://github.com/ruvnet/ruview) WiFi-DensePose platform and ESP32-S3 sensor nodes.
+## Credits & Attribution
+
+This project is a setup package and tooling wrapper built on top of **[RuView by ruvnet](https://github.com/ruvnet/ruview)** — all sensing, ML, and server code is their work. All credit for the core WiFi-DensePose technology goes to the ruvnet team.
+
+**Original code in this repo:**
+- `install.sh` — cross-platform auto-detecting installer
+- `ruview-slimevr-bridge.py` — SlimeVR VR body tracking bridge (novel integration)
+- `flash_board.sh` — WSL2 board flashing helper
+
+**From ruvnet/ruview:**
+- `esp32-csi-node.bin` and all firmware binaries — ESP32-S3 CSI capture firmware
+- `provision.py` — ESP32 WiFi provisioning script
+- The ruview Docker image (`ruvnet/wifi-densepose`) — all sensing, ML inference, and API
+
+If you find this useful, go star the upstream repo: https://github.com/ruvnet/ruview
 
 ## What this does
 
