@@ -6,8 +6,9 @@ Bridges ruview WiFi pose data to SlimeVR virtual trackers.
 Reads 17-keypoint COCO pose from ruview WebSocket and sends
 quaternion rotation packets to SlimeVR server via UDP.
 
-Supports two simultaneous players — ruview tracks both people
-and each gets their own independent set of virtual trackers.
+Supports two simultaneous players with T-pose calibration —
+each player strikes a T-pose to claim their person ID before
+the session starts, preventing interference from bystanders.
 
 Usage:
   python3 ruview-slimevr-bridge.py --slimevr-host 192.168.12.X
@@ -20,6 +21,7 @@ import math
 import socket
 import struct
 import argparse
+import time
 import websockets
 
 PACKET_HANDSHAKE     = 3
@@ -33,6 +35,11 @@ TRACKER_LEFT_SHIN   = 4
 TRACKER_RIGHT_SHIN  = 5
 
 TRACKER_COUNT = 6
+
+# T-pose calibration settings
+TPOSE_HOLD_SECONDS  = 2.0   # how long the pose must be held
+TPOSE_ARM_THRESHOLD = 0.12  # max vertical deviation of wrists vs shoulders (normalized)
+TPOSE_EXT_THRESHOLD = 0.15  # min horizontal extension of wrists beyond shoulders
 
 
 # ── Math helpers ──────────────────────────────────────────────────────────────
@@ -55,7 +62,6 @@ def midpoint(a, b):
     return ((a[0]+b[0])/2, (a[1]+b[1])/2, (a[2]+b[2])/2)
 
 def vec_to_quaternion(direction):
-    """Convert a direction vector to a quaternion (w,x,y,z)."""
     fwd = normalize(direction)
     world_up = (0.0, 1.0, 0.0)
     right = normalize(cross(world_up, fwd))
@@ -97,16 +103,13 @@ def vec_to_quaternion(direction):
 # ── Keypoint extraction ───────────────────────────────────────────────────────
 
 def extract_keypoints(person):
-    """Pull COCO keypoints into a dict, remapping to VR coordinate space."""
     kps = {}
     for kp in person.get('keypoints', []):
         name = kp['name']
-        # ruview: x=right, y=up(screen), z=depth → VR: x=right, y=up, z=forward
         kps[name] = (kp['x'], kp['y'], kp.get('z', 0.0))
     return kps
 
 def compute_trackers(kps):
-    """Derive quaternion for each virtual tracker from keypoint positions."""
     def get(name):
         return kps.get(name, (0.5, 0.5, 0.0))
 
@@ -133,6 +136,82 @@ def compute_trackers(kps):
     }
 
 
+# ── T-pose detection ──────────────────────────────────────────────────────────
+
+def is_tpose(kps):
+    """
+    Returns True if keypoints match a T-pose:
+    - Both wrists at roughly the same height as shoulders
+    - Both wrists extended outward beyond shoulders horizontally
+    """
+    def get(name):
+        return kps.get(name)
+
+    lshoulder = get('left_shoulder')
+    rshoulder = get('right_shoulder')
+    lwrist    = get('left_wrist')
+    rwrist    = get('right_wrist')
+
+    if not all([lshoulder, rshoulder, lwrist, rwrist]):
+        return False
+
+    # Check wrists are at shoulder height (y axis, normalized 0-1)
+    left_y_diff  = abs(lwrist[1] - lshoulder[1])
+    right_y_diff = abs(rwrist[1] - rshoulder[1])
+    if left_y_diff > TPOSE_ARM_THRESHOLD or right_y_diff > TPOSE_ARM_THRESHOLD:
+        return False
+
+    # Check wrists are extended outward beyond shoulders (x axis)
+    left_extended  = lshoulder[0] - lwrist[0]   # left wrist should be further left
+    right_extended = rwrist[0] - rshoulder[0]    # right wrist should be further right
+    if left_extended < TPOSE_EXT_THRESHOLD or right_extended < TPOSE_EXT_THRESHOLD:
+        return False
+
+    return True
+
+
+# ── Calibration ───────────────────────────────────────────────────────────────
+
+async def calibrate_player(ws, player_num, already_claimed, api_token=None):
+    """
+    Wait for a person to hold a T-pose for TPOSE_HOLD_SECONDS.
+    Returns the locked person ID for this player.
+    Skips person IDs already claimed by other players.
+    """
+    print(f"\n  Player {player_num}: Strike a T-pose and hold it for {int(TPOSE_HOLD_SECONDS)} seconds...")
+    print(f"  (Arms out straight, level with your shoulders)\n")
+
+    pose_start  = {}   # person_id -> timestamp when T-pose began
+
+    async for message in ws:
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            continue
+
+        now = time.monotonic()
+        persons = data.get('persons', [])
+
+        for person in persons:
+            pid = person.get('id', 0)
+            if pid in already_claimed:
+                continue
+
+            kps = extract_keypoints(person)
+
+            if is_tpose(kps):
+                if pid not in pose_start:
+                    pose_start[pid] = now
+                    print(f"  T-pose detected for person {pid} — hold it...")
+                elif now - pose_start[pid] >= TPOSE_HOLD_SECONDS:
+                    print(f"  Player {player_num} locked to person ID {pid}.")
+                    return pid
+            else:
+                if pid in pose_start:
+                    print(f"  Pose broken for person {pid} — try again.")
+                    del pose_start[pid]
+
+
 # ── SlimeVR UDP sender ────────────────────────────────────────────────────────
 
 class SlimeVRSender:
@@ -146,34 +225,33 @@ class SlimeVRSender:
         self.packet_num += 1
         return self.packet_num
 
-    def _mac(self, person_id, tracker_id):
-        # Unique fake MAC per person+tracker so SlimeVR treats each as distinct hardware
-        return bytes([0x52, 0x75, 0x56, 0x57, person_id & 0xFF, tracker_id & 0xFF])
+    def _mac(self, player_slot, tracker_id):
+        return bytes([0x52, 0x75, 0x56, 0x57, player_slot & 0xFF, tracker_id & 0xFF])
 
-    def send_handshake(self, person_id, tracker_id):
-        mac = self._mac(person_id, tracker_id)
+    def send_handshake(self, player_slot, tracker_id):
+        mac = self._mac(player_slot, tracker_id)
         firmware = b'ruview-bridge\x00'
         pkt  = struct.pack('>I', PACKET_HANDSHAKE)
         pkt += struct.pack('>Q', self._pnum())
-        pkt += struct.pack('>IIIIII', 0, 0, 0, 0, 0, 0)  # board/imu/mcu/info
+        pkt += struct.pack('>IIIIII', 0, 0, 0, 0, 0, 0)
         pkt += firmware
         pkt += mac
         self.sock.sendto(pkt, (self.host, self.port))
 
-    def send_rotation(self, person_id, tracker_id, quat):
+    def send_rotation(self, player_slot, tracker_id, quat):
         x, y, z, w = quat
         pkt  = struct.pack('>I', PACKET_ROTATION_DATA)
         pkt += struct.pack('>Q', self._pnum())
-        pkt += struct.pack('B', (person_id * TRACKER_COUNT) + tracker_id)
-        pkt += struct.pack('B', 1)           # data type: normal
+        pkt += struct.pack('B', (player_slot * TRACKER_COUNT) + tracker_id)
+        pkt += struct.pack('B', 1)
         pkt += struct.pack('>ffff', x, y, z, w)
-        pkt += struct.pack('B', 0)           # accuracy
+        pkt += struct.pack('B', 0)
         self.sock.sendto(pkt, (self.host, self.port))
 
 
 # ── Bridge loop ───────────────────────────────────────────────────────────────
 
-async def run_bridge(ruview_ws_url, slimevr_host, slimevr_port, api_token=None):
+async def run_bridge(ruview_ws_url, slimevr_host, slimevr_port, num_players, api_token=None):
     sender   = SlimeVRSender(slimevr_host, slimevr_port)
     handshook = set()
 
@@ -181,40 +259,66 @@ async def run_bridge(ruview_ws_url, slimevr_host, slimevr_port, api_token=None):
     if api_token:
         headers['Authorization'] = f'Bearer {api_token}'
 
-    print(f"Connecting to ruview  → {ruview_ws_url}")
+    print(f"\nConnecting to ruview  → {ruview_ws_url}")
     print(f"Forwarding to SlimeVR → {slimevr_host}:{slimevr_port}")
-    print("Waiting for pose data...")
+    print(f"Players: {num_players}\n")
 
     async with websockets.connect(ruview_ws_url, additional_headers=headers) as ws:
-        print("Connected.\n")
+        print("Connected to ruview.\n")
+        print("=" * 50)
+        print("  T-POSE CALIBRATION")
+        print("=" * 50)
+
+        # Calibrate each player in turn
+        player_map  = {}   # player_slot (0,1) -> locked person_id
+        claimed_ids = set()
+
+        for slot in range(num_players):
+            pid = await calibrate_player(ws, slot + 1, claimed_ids, api_token)
+            player_map[slot] = pid
+            claimed_ids.add(pid)
+
+        print("\n" + "=" * 50)
+        print("  CALIBRATION COMPLETE")
+        for slot, pid in player_map.items():
+            print(f"  Player {slot + 1} → person ID {pid}")
+        print("=" * 50)
+        print("\nStreaming body tracking data to SlimeVR...\n")
+
+        # Stream tracking data using locked player IDs only
         async for message in ws:
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
                 continue
 
-            for person in data.get('persons', []):
-                pid      = person.get('id', 0)
+            for slot, pid in player_map.items():
+                person = next(
+                    (p for p in data.get('persons', []) if p.get('id') == pid),
+                    None
+                )
+                if not person:
+                    continue
+
                 kps      = extract_keypoints(person)
                 trackers = compute_trackers(kps)
 
                 for tid, quat in trackers.items():
-                    key = (pid, tid)
+                    key = (slot, tid)
                     if key not in handshook:
-                        sender.send_handshake(pid, tid)
+                        sender.send_handshake(slot, tid)
                         handshook.add(key)
                         await asyncio.sleep(0.05)
-                        print(f"  Registered tracker person={pid} tracker={tid}")
 
-                    sender.send_rotation(pid, tid, quat)
+                    sender.send_rotation(slot, tid, quat)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='ruview → SlimeVR body tracking bridge')
+    parser = argparse.ArgumentParser(description='ruview → SlimeVR body tracking bridge with T-pose calibration')
     parser.add_argument(
         '--ruview-ws',
         default='ws://192.168.12.150:3001/ws/sensing',
-        help='ruview WebSocket URL (default: ws://192.168.12.150:3001/ws/sensing)',
+        help='ruview WebSocket URL',
     )
     parser.add_argument(
         '--slimevr-host',
@@ -228,13 +332,26 @@ def main():
         help='SlimeVR UDP port (default: 6969)',
     )
     parser.add_argument(
+        '--players',
+        type=int,
+        default=2,
+        choices=[1, 2],
+        help='Number of players to calibrate (default: 2)',
+    )
+    parser.add_argument(
         '--api-token',
         default='a7f3d2e1-9b4c-4f8a-b6e2-3d5c1a0f7e94',
         help='ruview API bearer token',
     )
     args = parser.parse_args()
 
-    asyncio.run(run_bridge(args.ruview_ws, args.slimevr_host, args.slimevr_port, args.api_token))
+    asyncio.run(run_bridge(
+        args.ruview_ws,
+        args.slimevr_host,
+        args.slimevr_port,
+        args.players,
+        args.api_token,
+    ))
 
 
 if __name__ == '__main__':
