@@ -67,8 +67,37 @@ Before the session starts, each player strikes a T-pose (arms out straight, leve
 - Left + right thigh
 - Left + right shin
 
+### Two player setup — step by step
+
+**Prerequisites:**
+- ruview server running on your dedicated machine
+- SlimeVR Server installed on your gaming PC (download from [slimevr.dev](https://slimevr.dev))
+- SlimeVR companion app installed on both Quest 3 headsets from the Meta store
+- Both headsets on the same local network as the ruview server
+
+**Steps:**
+
+1. Start SlimeVR Server on your gaming PC
+2. Open the SlimeVR companion app on both Quest 3 headsets and connect them to the server
+3. On the machine running ruview, start the bridge:
+   ```bash
+   python3 ruview-slimevr-bridge.py --slimevr-host YOUR_GAMING_PC_IP
+   ```
+4. The bridge will prompt Player 1 to calibrate first
+5. Player 1 stands in the play space and strikes a T-pose — arms out straight, level with shoulders — and holds it for 2 seconds
+6. The bridge confirms Player 1 is locked, then prompts Player 2
+7. Player 2 strikes their T-pose and holds for 2 seconds
+8. Both players are now locked — body tracking begins automatically
+9. Launch your VR game. Hip rotation maps to body turning — no thumbstick needed
+
+**Notes:**
+- Anyone else who walks into the room during a session is ignored
+- If tracking feels off, restart the bridge and recalibrate
+- For SteamVR games, configure hip-to-locomotion turning in the SteamVR input bindings per game
+
 ### Run command
 ```bash
+# Two players (default)
 python3 ruview-slimevr-bridge.py --slimevr-host YOUR_GAMING_PC_IP
 
 # Single player
