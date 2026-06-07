@@ -72,7 +72,7 @@ Before the session starts, each player strikes a T-pose (arms out straight, leve
 **Prerequisites:**
 - ruview server running on your dedicated machine
 - SlimeVR Server installed on your gaming PC (download from [slimevr.dev](https://slimevr.dev))
-- SlimeVR companion app installed on both Quest 3 headsets from the Meta store
+- SlimeVR companion app sideloaded on both Quest 3 headsets via [SideQuest](https://sidequestvr.com)
 - Both headsets on the same local network as the ruview server
 
 **Steps:**
