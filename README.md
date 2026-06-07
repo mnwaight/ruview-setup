@@ -53,9 +53,13 @@ The installer auto-detects your OS, distro, and environment (WSL2, native Linux,
 4. Walks you through flashing each ESP32-S3 board
 5. Launches the SlimeVR body tracking bridge
 
-## VR body tracking (SlimeVR bridge)
+## VR body tracking (experimental)
 
-The included `ruview-slimevr-bridge.py` reads ruview's 17-keypoint pose data and sends it to SlimeVR server as virtual trackers. Supports two simultaneous players with T-pose calibration to prevent bystanders from interfering with tracking.
+> **Note:** This is a prototype integration. Standard SlimeVR hardware uses ESP32 boards physically strapped to the body as IMU sensors. What we are doing here is fundamentally different — spoofing that protocol using WiFi-detected skeletal pose data from a room sensor. It may not behave identically to physical SlimeVR trackers and results will vary by game and platform.
+>
+> The ruview pose data stream opens up a lot of possibilities beyond this prototype. Other integration targets worth exploring include OSC (supported natively by VRChat), Virtual Motion Capture for SteamVR, and direct game SDK integrations. This bridge is a starting point, not a finished product.
+
+The included `ruview-slimevr-bridge.py` reads ruview's 17-keypoint pose data and attempts to forward it to SlimeVR server as virtual trackers. Supports two simultaneous players with T-pose calibration to prevent bystanders from interfering with tracking.
 
 ### T-pose calibration
 
