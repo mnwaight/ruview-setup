@@ -141,15 +141,7 @@ python3 ruview-slimevr-bridge.py --slimevr-host YOUR_GAMING_PC_IP --max-players 
 
 ## Future possibilities
 
-The ruview pose stream tracks every person in the space — registered players and everyone else. This opens up two compelling directions beyond the current prototype:
-
-**Non-VR users as in-game NPCs**
-Unregistered people in the room already have their full skeletal pose tracked. A game engine integration (Unity or Unreal plugin) consuming the unregistered pose stream could spawn and animate NPC characters driven by real human movement. Spectators watching from the sidelines appear as crowd NPCs. An instructor walks the real space and appears as a guide character inside the game. No wearables, no cameras — just the WiFi mesh that is already there.
-
-**VR players seeing real people through walls**
-The inverse direction — VR players could see unregistered room occupants rendered as outlines or ghost markers inside their headset, showing where real people are in the physical space in real time. This is both a safety feature (avoid collisions with non-VR people) and a potential game mechanic. A haunted house experience where a performer moving through the real room appears as a ghost that VR players can actually see and react to.
-
-Both of these are natural extensions of the existing pose data pipeline. The bridge already separates registered players from unregistered persons — the unregistered stream just needs a consumer.
+The ruview pose stream tracks every person in the space — registered players and everyone else. The bridge already separates registered players from unregistered persons, meaning the unregistered pose stream is available as a data source for further experimentation. What gets built on top of it is an open question worth exploring.
 
 ## Files
 
