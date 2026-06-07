@@ -61,9 +61,14 @@ The installer auto-detects your OS, distro, and environment (WSL2, native Linux,
 
 The included `ruview-slimevr-bridge.py` reads ruview's 17-keypoint pose data and attempts to forward it to SlimeVR server as virtual trackers. Supports two simultaneous players with T-pose calibration to prevent bystanders from interfering with tracking.
 
-### T-pose calibration
+### Zone-based registration
 
-Before the session starts, each player strikes a T-pose (arms out straight, level with shoulders) and holds it for 2 seconds. The bridge locks that person ID to that player slot. Only the two calibrated players are ever forwarded to SlimeVR — anyone else who walks into the room is ignored.
+Registration is handled by physical floor zones — no T-poses, no menus, no staff intervention. Two marked spots on the floor do all the work.
+
+- **Registration node** — a marked spot near the entrance. Stand in it for 1.5 seconds and you are automatically assigned a player slot.
+- **Exit node** — a marked zone near the exit. Walk through it and your slot is automatically freed for the next player.
+
+This scales to any number of simultaneous players. In a home setup the defaults work out of the box. In a VR farm, players walk in, register, play, walk out, and deregister — the system manages itself.
 
 ### Trackers per player
 - Hip (torso rotation — eliminates thumbstick turning in VR)
@@ -71,41 +76,44 @@ Before the session starts, each player strikes a T-pose (arms out straight, leve
 - Left + right thigh
 - Left + right shin
 
-### Two player setup — step by step
+### Setup — step by step
 
 **Prerequisites:**
 - ruview server running on your dedicated machine
 - SlimeVR Server installed on your gaming PC (download from [slimevr.dev](https://slimevr.dev))
 - SlimeVR companion app sideloaded on both Quest 3 headsets via [SideQuest](https://sidequestvr.com)
 - Both headsets on the same local network as the ruview server
+- Two marked spots on the floor — one near the entrance (registration), one near the exit
 
 **Steps:**
 
 1. Start SlimeVR Server on your gaming PC
-2. Open the SlimeVR companion app on both Quest 3 headsets and connect them to the server
-3. On the machine running ruview, start the bridge:
+2. Open the SlimeVR companion app on both Quest 3 headsets and connect to the server
+3. Start the bridge on the ruview machine:
    ```bash
    python3 ruview-slimevr-bridge.py --slimevr-host YOUR_GAMING_PC_IP
    ```
-4. The bridge will prompt Player 1 to calibrate first
-5. Player 1 stands in the play space and strikes a T-pose — arms out straight, level with shoulders — and holds it for 2 seconds
-6. The bridge confirms Player 1 is locked, then prompts Player 2
-7. Player 2 strikes their T-pose and holds for 2 seconds
-8. Both players are now locked — body tracking begins automatically
-9. Launch your VR game. Hip rotation maps to body turning — no thumbstick needed
+4. Player 1 walks to the registration spot and stands still for 1.5 seconds — registered automatically
+5. Player 2 does the same
+6. Both players are live — body tracking streams to SlimeVR immediately
+7. Launch your VR game. Hip rotation maps to body turning — no thumbstick needed
+8. When done, each player walks through the exit zone to deregister
 
 **Notes:**
-- Anyone else who walks into the room during a session is ignored
-- If tracking feels off, restart the bridge and recalibrate
-- For SteamVR games, configure hip-to-locomotion turning in the SteamVR input bindings per game
+- Anyone who does not stand at the registration spot is ignored entirely
+- Scales beyond 2 players with `--max-players`
+- For SteamVR games, configure hip-to-locomotion turning in SteamVR input bindings per game
 
 ### Run command
 ```bash
 # Two players (default)
 python3 ruview-slimevr-bridge.py --slimevr-host YOUR_GAMING_PC_IP
 
-# Single player
-python3 ruview-slimevr-bridge.py --slimevr-host YOUR_GAMING_PC_IP --players 1
+# VR farm — 10 players, custom zone positions
+python3 ruview-slimevr-bridge.py --slimevr-host YOUR_GAMING_PC_IP \
+    --max-players 10 \
+    --reg-zone 0.1,0.5 --reg-radius 0.08 \
+    --exit-zone 0.9,0.5 --exit-radius 0.10
 ```
 
 ## Files

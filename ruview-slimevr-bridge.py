@@ -6,13 +6,19 @@ Bridges ruview WiFi pose data to SlimeVR virtual trackers.
 Reads 17-keypoint COCO pose from ruview WebSocket and sends
 quaternion rotation packets to SlimeVR server via UDP.
 
-Supports two simultaneous players with T-pose calibration —
-each player strikes a T-pose to claim their person ID before
-the session starts, preventing interference from bystanders.
+Registration is zone-based — a marked spot on the floor acts as
+a registration node. When a person enters that zone they are
+automatically assigned a player slot. When they cross the exit
+zone they are deregistered. No T-pose or headset communication needed.
+
+Scales to any number of simultaneous players (home or VR farm).
 
 Usage:
-  python3 ruview-slimevr-bridge.py --slimevr-host 192.168.12.X
-  python3 ruview-slimevr-bridge.py --ruview-ws ws://192.168.12.150:3001/ws/sensing --slimevr-host 192.168.12.50
+  python3 ruview-slimevr-bridge.py --slimevr-host 192.168.12.102
+  python3 ruview-slimevr-bridge.py --slimevr-host 192.168.12.102 --max-players 10
+  python3 ruview-slimevr-bridge.py --slimevr-host 192.168.12.102 \\
+      --reg-zone 0.1,0.5 --reg-radius 0.08 \\
+      --exit-zone 0.9,0.5 --exit-radius 0.1
 """
 
 import asyncio
@@ -36,10 +42,17 @@ TRACKER_RIGHT_SHIN  = 5
 
 TRACKER_COUNT = 6
 
-# T-pose calibration settings
-TPOSE_HOLD_SECONDS  = 2.0   # how long the pose must be held
-TPOSE_ARM_THRESHOLD = 0.12  # max vertical deviation of wrists vs shoulders (normalized)
-TPOSE_EXT_THRESHOLD = 0.15  # min horizontal extension of wrists beyond shoulders
+# Default zone centers in normalized ruview space (0.0 - 1.0)
+# Registration node: left side of room
+DEFAULT_REG_ZONE   = (0.1, 0.5)
+DEFAULT_REG_RADIUS = 0.08
+
+# Exit/deregistration zone: right side of room
+DEFAULT_EXIT_ZONE   = (0.9, 0.5)
+DEFAULT_EXIT_RADIUS = 0.10
+
+# How long a person must stand in the registration zone before locking
+REG_DWELL_SECONDS = 1.5
 
 
 # ── Math helpers ──────────────────────────────────────────────────────────────
@@ -60,6 +73,12 @@ def subtract(a, b):
 
 def midpoint(a, b):
     return ((a[0]+b[0])/2, (a[1]+b[1])/2, (a[2]+b[2])/2)
+
+def distance_2d(a, b):
+    return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2)
+
+def in_zone(position_xy, zone_center, zone_radius):
+    return distance_2d(position_xy, zone_center) <= zone_radius
 
 def vec_to_quaternion(direction):
     fwd = normalize(direction)
@@ -109,6 +128,15 @@ def extract_keypoints(person):
         kps[name] = (kp['x'], kp['y'], kp.get('z', 0.0))
     return kps
 
+def person_position_2d(kps):
+    """Estimate person's floor position from hip midpoint."""
+    lhip = kps.get('left_hip')
+    rhip = kps.get('right_hip')
+    if lhip and rhip:
+        mid = midpoint(lhip, rhip)
+        return (mid[0], mid[2])   # x and depth as floor coords
+    return None
+
 def compute_trackers(kps):
     def get(name):
         return kps.get(name, (0.5, 0.5, 0.0))
@@ -134,82 +162,6 @@ def compute_trackers(kps):
         TRACKER_LEFT_SHIN:   vec_to_quaternion(subtract(lankle, lknee)),
         TRACKER_RIGHT_SHIN:  vec_to_quaternion(subtract(rankle, rknee)),
     }
-
-
-# ── T-pose detection ──────────────────────────────────────────────────────────
-
-def is_tpose(kps):
-    """
-    Returns True if keypoints match a T-pose:
-    - Both wrists at roughly the same height as shoulders
-    - Both wrists extended outward beyond shoulders horizontally
-    """
-    def get(name):
-        return kps.get(name)
-
-    lshoulder = get('left_shoulder')
-    rshoulder = get('right_shoulder')
-    lwrist    = get('left_wrist')
-    rwrist    = get('right_wrist')
-
-    if not all([lshoulder, rshoulder, lwrist, rwrist]):
-        return False
-
-    # Check wrists are at shoulder height (y axis, normalized 0-1)
-    left_y_diff  = abs(lwrist[1] - lshoulder[1])
-    right_y_diff = abs(rwrist[1] - rshoulder[1])
-    if left_y_diff > TPOSE_ARM_THRESHOLD or right_y_diff > TPOSE_ARM_THRESHOLD:
-        return False
-
-    # Check wrists are extended outward beyond shoulders (x axis)
-    left_extended  = lshoulder[0] - lwrist[0]   # left wrist should be further left
-    right_extended = rwrist[0] - rshoulder[0]    # right wrist should be further right
-    if left_extended < TPOSE_EXT_THRESHOLD or right_extended < TPOSE_EXT_THRESHOLD:
-        return False
-
-    return True
-
-
-# ── Calibration ───────────────────────────────────────────────────────────────
-
-async def calibrate_player(ws, player_num, already_claimed, api_token=None):
-    """
-    Wait for a person to hold a T-pose for TPOSE_HOLD_SECONDS.
-    Returns the locked person ID for this player.
-    Skips person IDs already claimed by other players.
-    """
-    print(f"\n  Player {player_num}: Strike a T-pose and hold it for {int(TPOSE_HOLD_SECONDS)} seconds...")
-    print(f"  (Arms out straight, level with your shoulders)\n")
-
-    pose_start  = {}   # person_id -> timestamp when T-pose began
-
-    async for message in ws:
-        try:
-            data = json.loads(message)
-        except json.JSONDecodeError:
-            continue
-
-        now = time.monotonic()
-        persons = data.get('persons', [])
-
-        for person in persons:
-            pid = person.get('id', 0)
-            if pid in already_claimed:
-                continue
-
-            kps = extract_keypoints(person)
-
-            if is_tpose(kps):
-                if pid not in pose_start:
-                    pose_start[pid] = now
-                    print(f"  T-pose detected for person {pid} — hold it...")
-                elif now - pose_start[pid] >= TPOSE_HOLD_SECONDS:
-                    print(f"  Player {player_num} locked to person ID {pid}.")
-                    return pid
-            else:
-                if pid in pose_start:
-                    print(f"  Pose broken for person {pid} — try again.")
-                    del pose_start[pid]
 
 
 # ── SlimeVR UDP sender ────────────────────────────────────────────────────────
@@ -249,10 +201,92 @@ class SlimeVRSender:
         self.sock.sendto(pkt, (self.host, self.port))
 
 
+# ── Zone-based session registry ───────────────────────────────────────────────
+
+class SessionRegistry:
+    def __init__(self, reg_zone, reg_radius, exit_zone, exit_radius, max_players):
+        self.reg_zone    = reg_zone
+        self.reg_radius  = reg_radius
+        self.exit_zone   = exit_zone
+        self.exit_radius = exit_radius
+        self.max_players = max_players
+
+        self.pid_to_slot  = {}   # person_id -> player_slot
+        self.slot_to_pid  = {}   # player_slot -> person_id
+        self.next_slot    = 0
+
+        # Tracks how long each unregistered person has been in the reg zone
+        self.reg_dwell    = {}   # person_id -> entry timestamp
+
+    def _next_available_slot(self):
+        used = set(self.slot_to_pid.keys())
+        for s in range(self.max_players):
+            if s not in used:
+                return s
+        return None
+
+    def process(self, persons):
+        """
+        Update registry based on current frame's person list.
+        Returns (newly_registered, newly_deregistered) person_id sets.
+        """
+        now = time.monotonic()
+        current_pids = {p.get('id') for p in persons}
+        registered   = set()
+        deregistered = set()
+
+        for person in persons:
+            pid = person.get('id')
+            kps = extract_keypoints(person)
+            pos = person_position_2d(kps)
+            if pos is None:
+                continue
+
+            # Deregistration check — registered player enters exit zone
+            if pid in self.pid_to_slot:
+                if in_zone(pos, self.exit_zone, self.exit_radius):
+                    slot = self.pid_to_slot.pop(pid)
+                    del self.slot_to_pid[slot]
+                    self.reg_dwell.pop(pid, None)
+                    deregistered.add(pid)
+                    print(f"  Player {slot + 1} (person {pid}) deregistered at exit zone.")
+
+            # Registration check — unregistered person enters reg zone
+            elif len(self.slot_to_pid) < self.max_players:
+                if in_zone(pos, self.reg_zone, self.reg_radius):
+                    if pid not in self.reg_dwell:
+                        self.reg_dwell[pid] = now
+                        print(f"  Person {pid} entering registration zone — hold position...")
+                    elif now - self.reg_dwell[pid] >= REG_DWELL_SECONDS:
+                        slot = self._next_available_slot()
+                        if slot is not None:
+                            self.pid_to_slot[pid] = slot
+                            self.slot_to_pid[slot] = pid
+                            self.reg_dwell.pop(pid, None)
+                            registered.add(pid)
+                            print(f"  Player {slot + 1} registered (person {pid}).")
+                else:
+                    self.reg_dwell.pop(pid, None)
+
+        # Clean up dwell tracking for people who left the frame
+        gone = set(self.reg_dwell.keys()) - current_pids
+        for pid in gone:
+            del self.reg_dwell[pid]
+
+        return registered, deregistered
+
+    def active_players(self):
+        return dict(self.slot_to_pid)   # slot -> pid
+
+
 # ── Bridge loop ───────────────────────────────────────────────────────────────
 
-async def run_bridge(ruview_ws_url, slimevr_host, slimevr_port, num_players, api_token=None):
+async def run_bridge(ruview_ws_url, slimevr_host, slimevr_port,
+                     reg_zone, reg_radius, exit_zone, exit_radius,
+                     max_players, api_token=None):
+
     sender   = SlimeVRSender(slimevr_host, slimevr_port)
+    registry = SessionRegistry(reg_zone, reg_radius, exit_zone, exit_radius, max_players)
     handshook = set()
 
     headers = {}
@@ -261,40 +295,26 @@ async def run_bridge(ruview_ws_url, slimevr_host, slimevr_port, num_players, api
 
     print(f"\nConnecting to ruview  → {ruview_ws_url}")
     print(f"Forwarding to SlimeVR → {slimevr_host}:{slimevr_port}")
-    print(f"Players: {num_players}\n")
+    print(f"Max players: {max_players}")
+    print(f"Registration zone: center={reg_zone} radius={reg_radius}")
+    print(f"Exit zone:         center={exit_zone} radius={exit_radius}")
+    print(f"\nWaiting for players to enter the registration zone...\n")
 
     async with websockets.connect(ruview_ws_url, additional_headers=headers) as ws:
         print("Connected to ruview.\n")
-        print("=" * 50)
-        print("  T-POSE CALIBRATION")
-        print("=" * 50)
 
-        # Calibrate each player in turn
-        player_map  = {}   # player_slot (0,1) -> locked person_id
-        claimed_ids = set()
-
-        for slot in range(num_players):
-            pid = await calibrate_player(ws, slot + 1, claimed_ids, api_token)
-            player_map[slot] = pid
-            claimed_ids.add(pid)
-
-        print("\n" + "=" * 50)
-        print("  CALIBRATION COMPLETE")
-        for slot, pid in player_map.items():
-            print(f"  Player {slot + 1} → person ID {pid}")
-        print("=" * 50)
-        print("\nStreaming body tracking data to SlimeVR...\n")
-
-        # Stream tracking data using locked player IDs only
         async for message in ws:
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
                 continue
 
-            for slot, pid in player_map.items():
+            persons = data.get('persons', [])
+            registry.process(persons)
+
+            for slot, pid in registry.active_players().items():
                 person = next(
-                    (p for p in data.get('persons', []) if p.get('id') == pid),
+                    (p for p in persons if p.get('id') == pid),
                     None
                 )
                 if not person:
@@ -313,43 +333,44 @@ async def run_bridge(ruview_ws_url, slimevr_host, slimevr_port, num_players, api
                     sender.send_rotation(slot, tid, quat)
 
 
+def parse_xy(s):
+    x, y = s.split(',')
+    return (float(x), float(y))
+
+
 def main():
-    parser = argparse.ArgumentParser(description='ruview → SlimeVR body tracking bridge with T-pose calibration')
-    parser.add_argument(
-        '--ruview-ws',
-        default='ws://192.168.12.150:3001/ws/sensing',
-        help='ruview WebSocket URL',
+    parser = argparse.ArgumentParser(
+        description='ruview → SlimeVR bridge with zone-based player registration'
     )
-    parser.add_argument(
-        '--slimevr-host',
-        required=True,
-        help='IP address of the PC running SlimeVR server',
-    )
-    parser.add_argument(
-        '--slimevr-port',
-        type=int,
-        default=6969,
-        help='SlimeVR UDP port (default: 6969)',
-    )
-    parser.add_argument(
-        '--players',
-        type=int,
-        default=2,
-        choices=[1, 2],
-        help='Number of players to calibrate (default: 2)',
-    )
-    parser.add_argument(
-        '--api-token',
-        default='a7f3d2e1-9b4c-4f8a-b6e2-3d5c1a0f7e94',
-        help='ruview API bearer token',
-    )
+    parser.add_argument('--ruview-ws', default='ws://192.168.12.150:3001/ws/sensing')
+    parser.add_argument('--slimevr-host', required=True)
+    parser.add_argument('--slimevr-port', type=int, default=6969)
+    parser.add_argument('--max-players', type=int, default=2,
+                        help='Maximum simultaneous players (default 2, no upper limit)')
+    parser.add_argument('--reg-zone', type=parse_xy,
+                        default=DEFAULT_REG_ZONE,
+                        metavar='X,Y',
+                        help='Registration zone center in normalized coords (default: 0.1,0.5)')
+    parser.add_argument('--reg-radius', type=float, default=DEFAULT_REG_RADIUS,
+                        help='Registration zone radius (default: 0.08)')
+    parser.add_argument('--exit-zone', type=parse_xy,
+                        default=DEFAULT_EXIT_ZONE,
+                        metavar='X,Y',
+                        help='Exit/deregistration zone center (default: 0.9,0.5)')
+    parser.add_argument('--exit-radius', type=float, default=DEFAULT_EXIT_RADIUS,
+                        help='Exit zone radius (default: 0.10)')
+    parser.add_argument('--api-token', default='a7f3d2e1-9b4c-4f8a-b6e2-3d5c1a0f7e94')
     args = parser.parse_args()
 
     asyncio.run(run_bridge(
         args.ruview_ws,
         args.slimevr_host,
         args.slimevr_port,
-        args.players,
+        args.reg_zone,
+        args.reg_radius,
+        args.exit_zone,
+        args.exit_radius,
+        args.max_players,
         args.api_token,
     ))
 
