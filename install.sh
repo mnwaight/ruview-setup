@@ -5,10 +5,22 @@
 
 set -e
 
-RUVIEW_SERVER="192.168.12.150"
-RUVIEW_WS="ws://${RUVIEW_SERVER}:3001/ws/sensing"
 SLIMEVR_PORT=6969
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+detect_local_ip() {
+    LOCAL_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -1)
+    if [ -z "$LOCAL_IP" ]; then
+        LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    if [ -z "$LOCAL_IP" ]; then
+        LOCAL_IP="127.0.0.1"
+    fi
+    echo "$LOCAL_IP"
+}
+
+RUVIEW_SERVER="$(detect_local_ip)"
+RUVIEW_WS="ws://${RUVIEW_SERVER}:3001/ws/sensing"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -98,8 +110,15 @@ detect_serial_group() {
 detect_serial_port() {
     # Returns the likely serial port path for the connected ESP32
     if $ENV_WSL; then
-        # WSL2: scan for ttyS* that correspond to Windows COM ports
+        # WSL2: check usbipd-attached devices first (ttyACM*), then ttyS* COM ports
         SERIAL_PORT=""
+        for port in /dev/ttyACM0 /dev/ttyACM1 /dev/ttyUSB0 /dev/ttyUSB1; do
+            if [ -e "$port" ]; then
+                SERIAL_PORT="$port"
+                info "Found serial port (usbipd): $SERIAL_PORT"
+                return
+            fi
+        done
         for port in /dev/ttyS{1..20}; do
             if [ -e "$port" ]; then
                 SERIAL_PORT="$port"
@@ -107,8 +126,8 @@ detect_serial_port() {
             fi
         done
         if [ -z "$SERIAL_PORT" ]; then
-            warn "No serial port found. Plug in the ESP32 board and check Device Manager for the COM port."
-            warn "Then use: /dev/ttySX where X is the COM port number (e.g. COM3 = /dev/ttyS3)"
+            warn "No serial port found. In PowerShell run: usbipd bind --busid <id> && usbipd attach --wsl --busid <id>"
+            warn "Then use /dev/ttyACM0, or check Device Manager for COM port (COM3 = /dev/ttyS3)"
         fi
     else
         # Native Linux/macOS: look for USB serial adapters
@@ -241,6 +260,9 @@ setup_ruview_server() {
     info "Pulling ruview Docker image..."
     docker pull ruvnet/wifi-densepose:latest
 
+    MODELS_DIR="$HOME/ruview-models"
+    mkdir -p "$MODELS_DIR"
+
     info "Starting ruview server..."
     docker run -d \
         --name ruview \
@@ -248,10 +270,17 @@ setup_ruview_server() {
         -p 3000:3000 \
         -p 3001:3001 \
         -p 5005:5005/udp \
+        -v "$MODELS_DIR:/app/data/models" \
         -e RUVIEW_API_TOKEN="$API_TOKEN" \
+        -e RUVIEW_SIMULATE_FALLBACK=false \
+        -e SENSING_ALLOWED_HOSTS="${RUVIEW_SERVER},${RUVIEW_SERVER}:3000,${RUVIEW_SERVER}:3001" \
         ruvnet/wifi-densepose:latest \
-        ./sensing-server --http-port 3000 --ws-port 3001 --bind-addr 0.0.0.0 --source auto \
+        ./sensing-server --http-port 3000 --ws-port 3001 --bind-addr 0.0.0.0 --source esp32 \
         --node-positions "$NODE_POSITIONS" \
+        --allowed-host "$RUVIEW_SERVER" \
+        --allowed-host "${RUVIEW_SERVER}:3000" \
+        --allowed-host "${RUVIEW_SERVER}:3001" \
+        --progressive \
         --no-edge-registry
 
     info "ruview server running."

@@ -459,37 +459,49 @@ async def run_bridge(ruview_ws_url, slimevr_host, slimevr_port,
     print(f"Exit zone      : center={exit_zone}  radius={exit_radius}")
     print(f"\nReady. Players stand at the registration spot to join.\n")
 
-    async with websockets.connect(ruview_ws_url, additional_headers=headers) as ws:
-        print("Connected to ruview.\n")
+    reconnect_delay = 2
+    while True:
+        try:
+            async with websockets.connect(ruview_ws_url, additional_headers=headers) as ws:
+                print("Connected to ruview.\n")
+                reconnect_delay = 2
 
-        async for message in ws:
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                continue
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                    except json.JSONDecodeError:
+                        continue
 
-            persons = data.get('persons', [])
-            registry.process(persons)
+                    persons = data.get('persons', [])
+                    registry.process(persons)
 
-            for slot, pid in registry.active_players().items():
-                person = next(
-                    (p for p in persons if p.get('id') == pid),
-                    None
-                )
-                if not person:
-                    continue
+                    for slot, pid in registry.active_players().items():
+                        person = next(
+                            (p for p in persons if p.get('id') == pid),
+                            None
+                        )
+                        if not person:
+                            continue
 
-                kps      = extract_keypoints(person)
-                trackers = compute_trackers(kps)
+                        kps      = extract_keypoints(person)
+                        trackers = compute_trackers(kps)
 
-                for tid, quat in trackers.items():
-                    key = (slot, tid)
-                    if key not in handshook:
-                        sender.send_handshake(slot, tid)
-                        handshook.add(key)
-                        await asyncio.sleep(0.05)
+                        for tid, quat in trackers.items():
+                            key = (slot, tid)
+                            if key not in handshook:
+                                sender.send_handshake(slot, tid)
+                                handshook.add(key)
+                                await asyncio.sleep(0.05)
 
-                    sender.send_rotation(slot, tid, quat)
+                            sender.send_rotation(slot, tid, quat)
+
+        except (websockets.exceptions.ConnectionClosed,
+                websockets.exceptions.WebSocketException,
+                OSError) as e:
+            print(f"ruview disconnected ({e}). Reconnecting in {reconnect_delay}s...")
+            handshook.clear()
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 30)
 
 
 def parse_xy(s):
@@ -503,7 +515,7 @@ def main():
     )
     parser.add_argument('--setup', action='store_true',
                         help='Run interactive zone setup mode (admin, one time)')
-    parser.add_argument('--ruview-ws', default='ws://192.168.12.150:3001/ws/sensing')
+    parser.add_argument('--ruview-ws', default='ws://localhost:3001/ws/sensing')
     parser.add_argument('--slimevr-host', default=None)
     parser.add_argument('--slimevr-port', type=int, default=6969)
     parser.add_argument('--max-players', type=int, default=2)
@@ -511,7 +523,7 @@ def main():
     parser.add_argument('--reg-radius', type=float, default=None)
     parser.add_argument('--exit-zone', type=parse_xy, default=None, metavar='X,Y')
     parser.add_argument('--exit-radius', type=float, default=None)
-    parser.add_argument('--api-token', default='a7f3d2e1-9b4c-4f8a-b6e2-3d5c1a0f7e94')
+    parser.add_argument('--api-token', default=None)
     args = parser.parse_args()
 
     if args.setup:
